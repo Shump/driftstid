@@ -1,0 +1,13 @@
+[package]
+name = "driftstid"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+uring-sys = "0.7"
+iou = "0.3"
+
+[dev-dependencies]
+futures = "0.3"
