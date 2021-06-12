@@ -46,15 +46,9 @@ mod v_table {
     );
 }
 
-pub enum Event {
-    Timeout {
-        waker: std::task::Waker,
-        result: Option<Result<u32, std::io::Error>>,
-    },
-    Accept {
-        waker: std::task::Waker,
-        result: Option<Result<u32, std::io::Error>>,
-    },
+pub struct Event {
+    waker: std::task::Waker,
+    result: Option<Result<u32, std::io::Error>>,
 }
 
 mod inner {
@@ -167,12 +161,11 @@ pub mod system {
                         if let Entry::Vacant(entry) = events.entry(event_id) {
                             println!("creating event: {}", event_id);
                             let waker = cx.waker().clone();
-                            let event = Event::Timeout {waker, result: None};
-                            if let Event::Timeout {..} = entry.insert(event) {
-                                unsafe {
-                                    sqe.prep_timeout(self.timespec, 0, TimeoutFlags::empty());
-                                    sqe.set_user_data(event_id as u64);
-                                }
+                            let event = Event {waker, result: None};
+                            entry.insert(event);
+                            unsafe {
+                                sqe.prep_timeout(self.timespec, 0, TimeoutFlags::empty());
+                                sqe.set_user_data(event_id as u64);
                             }
                         }
                     })});
@@ -193,18 +186,17 @@ pub mod system {
                             Entry::Vacant(entry) => panic!("missing event"),
                             Entry::Occupied(entry) => {
                                 match entry.get() {
-                                    Event::Timeout {result: Some(_), ..} => {
+                                    Event {result: Some(_), ..} => {
                                         let result = match entry.remove() {
-                                            Event::Timeout {result: Some(result), ..} => result,
-                                            event => panic!("unexpected state"), // XXX
+                                            Event {result: Some(result), ..} => result,
+                                            Event {result: None, ..} => panic!("unexpected state"), // XXX
                                         };
                                         Poll::Ready(result)
                                     }
-                                    Event::Timeout {result: None, ..} => {
+                                    Event {result: None, ..} => {
                                         println!("result still pending");
                                         Poll::Pending
                                     }
-                                    event => panic!("unexpected event"),
                                 }
                             }
                         }
@@ -237,7 +229,7 @@ pub mod system {
                         let mut sqe = ring.prepare_sqe().unwrap();
                         if let Entry::Vacant(entry) = events.entry(event_id) {
                             let waker = cx.waker().clone();
-                            let event = Event::Accept {waker, result: None };
+                            let event = Event {waker, result: None };
                             entry.insert(event);
                             let fd = self.fd;
                             match self.addr {
@@ -264,16 +256,16 @@ pub mod system {
                             Entry::Vacant(entry) => panic!("missing event"),
                             Entry::Occupied(entry) => {
                                 match entry.get() {
-                                    Event::Accept {result: Some(_), ..} => {
+                                    Event {result: Some(_), ..} => {
                                         let result = match entry.remove() {
-                                            Event::Accept {result: Some(result), ..} => {
+                                            Event {result: Some(result), ..} => {
                                                 result
                                             },
-                                            event => panic!("unexpected state"), // XXX
+                                            Event {result: None, ..} => panic!("unexpected state"), // XXX
                                         };
                                         Poll::Ready(result)
                                     }
-                                    Event::Accept {result: None, ..} => {
+                                    Event {result: None, ..} => {
                                         println!("result still pending");
                                         Poll::Pending
                                     }
@@ -498,12 +490,8 @@ impl Runtime {
                     for (event_id, result) in completed_events {
                         println!("Waking up waker: {}", event_id);
                         match events.borrow_mut().get_mut(&event_id) {
-                            Some(Event::Timeout {waker, result: res}) => {
+                            Some(Event {waker, result: res}) => {
                                 // println!("timeout result: {:?}", result);
-                                waker.wake_by_ref();
-                                *res = Some(result);
-                            }
-                            Some(Event::Accept {waker, result: res}) => {
                                 waker.wake_by_ref();
                                 *res = Some(result);
                             }
