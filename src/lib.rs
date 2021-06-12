@@ -109,13 +109,6 @@ pub mod system {
         }.await
     }
 
-    trait IOEvent {
-        fn submit(sqe: &mut iou::SQE);
-    }
-
-    struct TimeoutEvent {
-    }
-
     #[derive(Copy, Clone)]
     enum State {
         Waiting,
@@ -275,6 +268,104 @@ pub mod system {
                         }
                     })
 
+                }
+            }
+        }
+    }
+
+    pub async fn timeout_prime(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
+        let event_id = get_event_id();
+        RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            let mut sqe = ring.prepare_sqe().unwrap();
+            unsafe {
+                sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty());
+                sqe.set_user_data(event_id as u64);
+            }
+        });
+        let event = EventFuture {
+            event_id,
+            state: State::Waiting,
+        };
+        event.await
+    }
+
+    /// invariant: addr has to live until future completion
+    pub async unsafe fn accept_prime(
+        fd: std::os::unix::io::RawFd,
+        addr: Option<&mut iou::sqe::SockAddrStorage>
+    ) -> Result<u32, std::io::Error> {
+        let event_id = get_event_id();
+        RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            let mut sqe = ring.prepare_sqe().unwrap();
+            unsafe {
+                sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty());
+                sqe.set_user_data(event_id as u64);
+            }
+        });
+        let event = EventFuture {
+            event_id,
+            state: State::Waiting,
+        };
+        event.await
+    }
+
+    struct EventFuture<> {
+        event_id: usize,
+        state: State,
+    }
+
+    impl Future for EventFuture {
+        type Output = Result<u32, std::io::Error>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.as_ref().state {
+                State::Waiting => {
+                    EVENTS.with(|events| {
+                        let mut events = events.borrow_mut();
+
+                        use std::collections::hash_map::Entry;
+                        if let Entry::Vacant(entry) = events.entry(self.event_id) {
+                            let waker = cx.waker().clone();
+                            let event = Event {waker, result: None};
+                            entry.insert(event);
+                        }
+                    });
+
+                    EVENTS_PREPARED.with(|events_prepared| {
+                        *events_prepared.borrow_mut() = true;
+                    });
+
+                    self.as_mut().state = State::Pending(self.event_id);
+
+                    Poll::Pending
+                }
+                State::Pending(event_id) => {
+                    EVENTS.with(|events| {
+                        let mut events = events.borrow_mut();
+                        use std::collections::hash_map::Entry;
+                        match events.entry(event_id) {
+                            Entry::Vacant(_) => panic!("missing event"),
+                            Entry::Occupied(entry) => {
+                                match entry.get() {
+                                    Event {result: Some(_), ..} => {
+                                        let result = match entry.remove() {
+                                            Event {result: Some(result), ..} => {
+                                                result
+                                            },
+                                            Event {result: None, ..} => panic!("unexpected state"), // XXX
+                                        };
+                                        Poll::Ready(result)
+                                    }
+                                    Event {result: None, ..} => {
+                                        println!("result still pending");
+                                        Poll::Pending
+                                    }
+                                }
+                            }
+                        }
+                    })
                 }
             }
         }
@@ -619,18 +710,15 @@ mod tests {
     }
 
     #[test]
-    fn sleep() {
+    fn timeout() {
         use std::time::Duration;
 
         let runtime = Runtime {};
         let timespec = make_timespec(Duration::from_secs(1));
-        let ret = runtime.run(
-            system::timeout(&timespec)
-            .then(|result| {
-                system::timeout(&timespec)
-            })
-            .map(|_| 42)
-        );
+        let ret = runtime.run(async {
+            system::timeout_prime(&timespec).await;
+            42
+        });
         assert_eq!(42, ret);
     }
 
@@ -655,12 +743,12 @@ mod tests {
             let t = spawn(async {
                 println!("long sleep");
                 let timespec = make_timespec(Duration::from_secs(3));
-                system::timeout(&timespec).await;
+                system::timeout_prime(&timespec).await;
                 println!("long sleep finished");
             });
             println!("short sleep");
             let timespec = make_timespec(Duration::from_secs(2));
-            system::timeout(&timespec).await;
+            system::timeout_prime(&timespec).await;
             println!("short sleep finished");
             println!("waiting for long sleep");
             t.await;
@@ -681,14 +769,14 @@ mod tests {
             let fd1 = l1.into_raw_fd();
             let mut a1 = iou::sqe::SockAddrStorage::uninit();
             let f1 = unsafe {
-                system::accept(fd1, Some(&mut a1))
+                system::accept_prime(fd1, Some(&mut a1))
             };
 
             let l2 = std::net::TcpListener::bind("127.0.0.1:12346").unwrap();
             let fd2 = l2.into_raw_fd();
             let mut a2 = iou::sqe::SockAddrStorage::uninit();
             let f2 = unsafe {
-                system::accept(fd2, Some(&mut a2))
+                system::accept_prime(fd2, Some(&mut a2))
             };
 
             // unsafe {
