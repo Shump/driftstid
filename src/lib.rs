@@ -90,188 +90,26 @@ pub mod system {
     use std::time::{Duration, Instant};
     use crate::Event;
 
-    pub async fn timeout(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
-        Timeout {
-            state: State::Waiting,
-            timespec,
-        }.await
-    }
-
-    /// invariant: addr has to live until future completion
-    pub async unsafe fn accept(
-        fd: std::os::unix::io::RawFd,
-        addr: Option<&mut iou::sqe::SockAddrStorage>
-    ) -> Result<u32, std::io::Error> {
-        Accept {
-            state: State::Waiting,
-            fd,
-            addr,
-        }.await
-    }
-
     #[derive(Copy, Clone)]
     enum State {
         Waiting,
         Pending(usize),
     }
 
-    struct Timeout<'a> {
-        state: State,
-        timespec: &'a uring_sys::__kernel_timespec,
-    }
-
-    // XXX is this necessary? does it work?
-    impl<'a> Drop for Timeout<'a> {
-        fn drop(&mut self) {
-            match self.state {
-                State::Pending(event_id) => {
-                    EVENTS.with(|events| {
-                        events.borrow_mut().remove(&event_id);
-                    })
-                }
-                _ => {}
-            }
-        }
-    }
-
-    impl<'a> Future for Timeout<'a> {
-        type Output = Result<u32, std::io::Error>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            match self.as_ref().state {
-                State::Waiting => {
-                    println!("I was waiting");
-                    let event_id = get_event_id();
-
-                    RING.with(|ring| { EVENTS.with(|events| {
-                        use std::collections::hash_map::Entry;
-                        use iou::sqe::TimeoutFlags;
-
-                        let mut ring = ring.borrow_mut();
-                        let mut events = events.borrow_mut();
-
-                        let mut sqe = ring.prepare_sqe().unwrap();
-                        if let Entry::Vacant(entry) = events.entry(event_id) {
-                            println!("creating event: {}", event_id);
-                            let waker = cx.waker().clone();
-                            let event = Event {waker, result: None};
-                            entry.insert(event);
-                            unsafe {
-                                sqe.prep_timeout(self.timespec, 0, TimeoutFlags::empty());
-                                sqe.set_user_data(event_id as u64);
-                            }
-                        }
-                    })});
-
-                    EVENTS_PREPARED.with(|events_prepared| {
-                        *events_prepared.borrow_mut() = true;
-                    });
-
-                    self.as_mut().state = State::Pending(event_id);
-
-                    Poll::Pending
-                }
-                State::Pending(event_id) => {
-                    EVENTS.with(|events| {
-                        let mut events = events.borrow_mut();
-                        use std::collections::hash_map::Entry;
-                        match events.entry(event_id) {
-                            Entry::Vacant(entry) => panic!("missing event"),
-                            Entry::Occupied(entry) => {
-                                match entry.get() {
-                                    Event {result: Some(_), ..} => {
-                                        let result = match entry.remove() {
-                                            Event {result: Some(result), ..} => result,
-                                            Event {result: None, ..} => panic!("unexpected state"), // XXX
-                                        };
-                                        Poll::Ready(result)
-                                    }
-                                    Event {result: None, ..} => {
-                                        println!("result still pending");
-                                        Poll::Pending
-                                    }
-                                }
-                            }
-                        }
-                    })
-                }
-            }
-        }
-    }
-
-    struct Accept<'a> {
-        state: State,
-        fd: std::os::unix::io::RawFd,
-        addr: Option<&'a mut iou::sqe::SockAddrStorage>,
-    }
-
-    impl<'a> Future for Accept<'a> {
-        type Output = Result<u32, std::io::Error>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            match self.as_ref().state {
-                State::Waiting => {
-                    let event_id = get_event_id();
-
-                    RING.with(|ring| { EVENTS.with(|events| {
-                        use std::collections::hash_map::Entry;
-
-                        let mut ring = ring.borrow_mut();
-                        let mut events = events.borrow_mut();
-
-                        let mut sqe = ring.prepare_sqe().unwrap();
-                        if let Entry::Vacant(entry) = events.entry(event_id) {
-                            let waker = cx.waker().clone();
-                            let event = Event {waker, result: None };
-                            entry.insert(event);
-                            let fd = self.fd;
-                            match self.addr {
-                                Some(ref mut addr) => unsafe { sqe.prep_accept(fd, Some(addr), iou::sqe::SockFlag::empty()); } // XXX option.take instead
-                                None => unsafe { sqe.prep_accept(fd, None, iou::sqe::SockFlag::empty()); }
-                            };
-                            unsafe { sqe.set_user_data(event_id as u64); }
-                        }
-                    })});
-
-                    EVENTS_PREPARED.with(|events_prepared| {
-                        *events_prepared.borrow_mut() = true;
-                    });
-
-                    self.as_mut().state = State::Pending(event_id);
-
-                    Poll::Pending
-                }
-                State::Pending(event_id) => {
-                    EVENTS.with(|events| {
-                        let mut events = events.borrow_mut();
-                        use std::collections::hash_map::Entry;
-                        match events.entry(event_id) {
-                            Entry::Vacant(entry) => panic!("missing event"),
-                            Entry::Occupied(entry) => {
-                                match entry.get() {
-                                    Event {result: Some(_), ..} => {
-                                        let result = match entry.remove() {
-                                            Event {result: Some(result), ..} => {
-                                                result
-                                            },
-                                            Event {result: None, ..} => panic!("unexpected state"), // XXX
-                                        };
-                                        Poll::Ready(result)
-                                    }
-                                    Event {result: None, ..} => {
-                                        println!("result still pending");
-                                        Poll::Pending
-                                    }
-                                    event => panic!("unexpected event"),
-                                }
-                            }
-                        }
-                    })
-
-                }
-            }
-        }
-    }
+    // // XXX is this necessary? does it work?
+    // // Timeout future used to have this... but not sure why?
+    // impl<'a> Drop for Timeout<'a> {
+    //     fn drop(&mut self) {
+    //         match self.state {
+    //             State::Pending(event_id) => {
+    //                 EVENTS.with(|events| {
+    //                     events.borrow_mut().remove(&event_id);
+    //                 })
+    //             }
+    //             _ => {}
+    //         }
+    //     }
+    // }
 
     pub async fn timeout_prime(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
         let event_id = get_event_id();
@@ -279,7 +117,7 @@ pub mod system {
             let mut ring = ring.borrow_mut();
             let mut sqe = ring.prepare_sqe().unwrap();
             unsafe {
-                sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty());
+                sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty()); // TODO maka parameters
                 sqe.set_user_data(event_id as u64);
             }
         });
@@ -291,7 +129,7 @@ pub mod system {
     }
 
     /// invariant: addr has to live until future completion
-    pub async unsafe fn accept_prime(
+    pub async unsafe fn accept(
         fd: std::os::unix::io::RawFd,
         addr: Option<&mut iou::sqe::SockAddrStorage>
     ) -> Result<u32, std::io::Error> {
@@ -300,7 +138,7 @@ pub mod system {
             let mut ring = ring.borrow_mut();
             let mut sqe = ring.prepare_sqe().unwrap();
             unsafe {
-                sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty());
+                sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty()); // TODO maka parameter
                 sqe.set_user_data(event_id as u64);
             }
         });
@@ -346,15 +184,14 @@ pub mod system {
                         let mut events = events.borrow_mut();
                         use std::collections::hash_map::Entry;
                         match events.entry(event_id) {
-                            Entry::Vacant(_) => panic!("missing event"),
+                            Entry::Vacant(_) => panic!("missing event: {}", event_id),
                             Entry::Occupied(entry) => {
                                 match entry.get() {
                                     Event {result: Some(_), ..} => {
-                                        let result = match entry.remove() {
-                                            Event {result: Some(result), ..} => {
-                                                result
-                                            },
-                                            Event {result: None, ..} => panic!("unexpected state"), // XXX
+                                        let event = entry.remove();
+                                        let result = match event.result {
+                                            Some(result) => result,
+                                            None => panic!("unexpected state: {}", event_id),
                                         };
                                         Poll::Ready(result)
                                     }
@@ -769,14 +606,14 @@ mod tests {
             let fd1 = l1.into_raw_fd();
             let mut a1 = iou::sqe::SockAddrStorage::uninit();
             let f1 = unsafe {
-                system::accept_prime(fd1, Some(&mut a1))
+                system::accept(fd1, Some(&mut a1))
             };
 
             let l2 = std::net::TcpListener::bind("127.0.0.1:12346").unwrap();
             let fd2 = l2.into_raw_fd();
             let mut a2 = iou::sqe::SockAddrStorage::uninit();
             let f2 = unsafe {
-                system::accept_prime(fd2, Some(&mut a2))
+                system::accept(fd2, Some(&mut a2))
             };
 
             // unsafe {
