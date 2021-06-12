@@ -149,6 +149,24 @@ pub mod system {
         event.await
     }
 
+    pub async unsafe fn connect(
+        fd: std::os::unix::io::RawFd,
+        socket_addr: &iou::sqe::SockAddr,
+    ) -> Result<u32, std::io::Error> {
+        let event_id = get_event_id();
+        RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            let mut sqe = ring.prepare_sqe().unwrap();
+            sqe.prep_connect(fd, socket_addr);
+            sqe.set_user_data(event_id as u64);
+        });
+        let event = EventFuture {
+            event_id,
+            state: State::Waiting,
+        };
+        event.await
+    }
+
     struct EventFuture<> {
         event_id: usize,
         state: State,
@@ -633,6 +651,43 @@ mod tests {
             };
 
             println!("connected_fd: {}, addr: {}", fd.unwrap(), unsafe { addr.as_socket_addr() }.unwrap());
+        });
+    }
+
+    #[test]
+    fn connect() {
+        let runtime = Runtime {};
+        runtime.run(async {
+            use std::os::unix::io::IntoRawFd;
+            use std::net::{TcpListener, TcpStream};
+
+            let accept_task = spawn(async {
+                println!("> accept start");
+                let listener = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
+                let fd = listener.into_raw_fd();
+                let result = unsafe { system::accept(fd, None) }.await;
+                println!("> accept completed: {:?}", result);
+                result
+            });
+
+            let connect_task = spawn(async {
+                println!("> connect start");
+                let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+                let socket_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+                let sock_addr = iou::sqe::SockAddr::Inet(nix::sys::socket::InetAddr::from_std(&socket_addr));
+                let result = unsafe { system::connect(fd, &sock_addr) }.await;
+                println!("> connect completed: {:?}", result);
+                result
+            });
+
+            println!("> awaiting connect");
+            let connect = connect_task.await;
+            println!("> awaiting accept");
+            let accept = accept_task.await;
+            // let (connect, accept) = futures::join!(connect_task, accept_task);
+
+            assert_eq!(true, matches!(accept, Ok(_)));
+            assert_eq!(true, matches!(connect, Ok(0)));
         });
     }
 }
