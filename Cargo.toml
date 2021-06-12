@@ -8,6 +8,7 @@ edition = "2018"
 [dependencies]
 uring-sys = "0.7"
 iou = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 futures = "0.3"

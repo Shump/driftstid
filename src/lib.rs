@@ -5,6 +5,13 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::cell::RefCell;
 
+fn make_timespec(duration: std::time::Duration) -> uring_sys::__kernel_timespec {
+    uring_sys::__kernel_timespec {
+        tv_sec: duration.as_secs() as i64, // TODO
+        tv_nsec: duration.subsec_nanos() as i64, // TODO
+    }
+}
+
 mod v_table {
     use std::task::{RawWaker, RawWakerVTable};
 
@@ -42,13 +49,12 @@ mod v_table {
 pub enum Event {
     Timeout {
         waker: std::task::Waker,
-        timespec: uring_sys::__kernel_timespec,
         result: Option<Result<u32, std::io::Error>>,
     },
-    // Accept {
-    //     waker: std::task::Waker,
-    //     result: std::rc::Rc<std::cell::Cell<Option<u32>>>,
-    // },
+    Accept {
+        waker: std::task::Waker,
+        result: Option<Result<u32, std::io::Error>>,
+    },
 }
 
 mod inner {
@@ -90,11 +96,30 @@ pub mod system {
     use std::time::{Duration, Instant};
     use crate::Event;
 
-    pub async fn timeout(duration: Duration) -> Result<u32, std::io::Error> {
+    pub async fn timeout(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
         Timeout {
             state: State::Waiting,
-            duration,
+            timespec,
         }.await
+    }
+
+    /// invariant: addr has to live until future completion
+    pub async unsafe fn accept(
+        fd: std::os::unix::io::RawFd,
+        addr: Option<&mut iou::sqe::SockAddrStorage>
+    ) -> Result<u32, std::io::Error> {
+        Accept {
+            state: State::Waiting,
+            fd,
+            addr,
+        }.await
+    }
+
+    trait IOEvent {
+        fn submit(sqe: &mut iou::SQE);
+    }
+
+    struct TimeoutEvent {
     }
 
     #[derive(Copy, Clone)]
@@ -103,12 +128,13 @@ pub mod system {
         Pending(usize),
     }
 
-    struct Timeout {
+    struct Timeout<'a> {
         state: State,
-        duration: Duration,
+        timespec: &'a uring_sys::__kernel_timespec,
     }
 
-    impl Drop for Timeout {
+    // XXX is this necessary? does it work?
+    impl<'a> Drop for Timeout<'a> {
         fn drop(&mut self) {
             match self.state {
                 State::Pending(event_id) => {
@@ -121,23 +147,14 @@ pub mod system {
         }
     }
 
-    impl Future for Timeout {
+    impl<'a> Future for Timeout<'a> {
         type Output = Result<u32, std::io::Error>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             match self.as_ref().state {
                 State::Waiting => {
                     println!("I was waiting");
-                    let event_id = NEXT_EVENT_ID.with(|next_event_id| {
-                        let mut next_event_id = next_event_id.borrow_mut();
-                        let event_id = *next_event_id;
-                        *next_event_id += 1;
-                        event_id;
-                        crate::NEXT_GLOBAL_ID.with(|id| {
-                            let i = *id.borrow() + 1;
-                            id.replace(i)
-                        })
-                    });
+                    let event_id = get_event_id();
 
                     RING.with(|ring| { EVENTS.with(|events| {
                         use std::collections::hash_map::Entry;
@@ -149,12 +166,11 @@ pub mod system {
                         let mut sqe = ring.prepare_sqe().unwrap();
                         if let Entry::Vacant(entry) = events.entry(event_id) {
                             println!("creating event: {}", event_id);
-                            let timespec = make_timespec(self.duration);
                             let waker = cx.waker().clone();
-                            let event = Event::Timeout {waker, timespec, result: None};
-                            if let Event::Timeout {timespec, ..} = entry.insert(event) {
+                            let event = Event::Timeout {waker, result: None};
+                            if let Event::Timeout {..} = entry.insert(event) {
                                 unsafe {
-                                    sqe.prep_timeout(&timespec, 0, TimeoutFlags::empty());
+                                    sqe.prep_timeout(self.timespec, 0, TimeoutFlags::empty());
                                     sqe.set_user_data(event_id as u64);
                                 }
                             }
@@ -198,29 +214,92 @@ pub mod system {
         }
     }
 
-    fn make_timespec(duration: Duration) -> uring_sys::__kernel_timespec {
-        uring_sys::__kernel_timespec {
-            tv_sec: duration.as_secs() as i64, // TODO
-            tv_nsec: duration.subsec_nanos() as i64, // TODO
+    struct Accept<'a> {
+        state: State,
+        fd: std::os::unix::io::RawFd,
+        addr: Option<&'a mut iou::sqe::SockAddrStorage>,
+    }
+
+    impl<'a> Future for Accept<'a> {
+        type Output = Result<u32, std::io::Error>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.as_ref().state {
+                State::Waiting => {
+                    let event_id = get_event_id();
+
+                    RING.with(|ring| { EVENTS.with(|events| {
+                        use std::collections::hash_map::Entry;
+
+                        let mut ring = ring.borrow_mut();
+                        let mut events = events.borrow_mut();
+
+                        let mut sqe = ring.prepare_sqe().unwrap();
+                        if let Entry::Vacant(entry) = events.entry(event_id) {
+                            let waker = cx.waker().clone();
+                            let event = Event::Accept {waker, result: None };
+                            entry.insert(event);
+                            let fd = self.fd;
+                            match self.addr {
+                                Some(ref mut addr) => unsafe { sqe.prep_accept(fd, Some(addr), iou::sqe::SockFlag::empty()); } // XXX option.take instead
+                                None => unsafe { sqe.prep_accept(fd, None, iou::sqe::SockFlag::empty()); }
+                            };
+                            unsafe { sqe.set_user_data(event_id as u64); }
+                        }
+                    })});
+
+                    EVENTS_PREPARED.with(|events_prepared| {
+                        *events_prepared.borrow_mut() = true;
+                    });
+
+                    self.as_mut().state = State::Pending(event_id);
+
+                    Poll::Pending
+                }
+                State::Pending(event_id) => {
+                    EVENTS.with(|events| {
+                        let mut events = events.borrow_mut();
+                        use std::collections::hash_map::Entry;
+                        match events.entry(event_id) {
+                            Entry::Vacant(entry) => panic!("missing event"),
+                            Entry::Occupied(entry) => {
+                                match entry.get() {
+                                    Event::Accept {result: Some(_), ..} => {
+                                        let result = match entry.remove() {
+                                            Event::Accept {result: Some(result), ..} => {
+                                                result
+                                            },
+                                            event => panic!("unexpected state"), // XXX
+                                        };
+                                        Poll::Ready(result)
+                                    }
+                                    Event::Accept {result: None, ..} => {
+                                        println!("result still pending");
+                                        Poll::Pending
+                                    }
+                                    event => panic!("unexpected event"),
+                                }
+                            }
+                        }
+                    })
+
+                }
+            }
         }
     }
 
-    struct Accept {
-        state: State,
+    fn get_event_id() -> usize {
+        NEXT_EVENT_ID.with(|next_event_id| {
+            let mut next_event_id = next_event_id.borrow_mut();
+            let event_id = *next_event_id;
+            *next_event_id += 1;
+            event_id;
+            crate::NEXT_GLOBAL_ID.with(|id| {
+                let i = *id.borrow() + 1;
+                id.replace(i)
+            })
+        })
     }
-
-    // impl Future for Accept {
-    //     type Output = Result<u32, std::io::Error>;
-
-    //     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    //         match self.as_ref().state {
-    //             State::Waiting => {
-    //             }
-    //             State::Pending(event_id) => {
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 // TODO enhance
@@ -419,8 +498,12 @@ impl Runtime {
                     for (event_id, result) in completed_events {
                         println!("Waking up waker: {}", event_id);
                         match events.borrow_mut().get_mut(&event_id) {
-                            Some(Event::Timeout {waker, timespec: _, result: res}) => {
+                            Some(Event::Timeout {waker, result: res}) => {
                                 // println!("timeout result: {:?}", result);
+                                waker.wake_by_ref();
+                                *res = Some(result);
+                            }
+                            Some(Event::Accept {waker, result: res}) => {
                                 waker.wake_by_ref();
                                 *res = Some(result);
                             }
@@ -552,10 +635,11 @@ mod tests {
         use std::time::Duration;
 
         let runtime = Runtime {};
+        let timespec = make_timespec(Duration::from_secs(1));
         let ret = runtime.run(
-            system::timeout(Duration::from_secs(1))
+            system::timeout(&timespec)
             .then(|result| {
-                system::timeout(Duration::from_secs(1))
+                system::timeout(&timespec)
             })
             .map(|_| 42)
         );
@@ -582,11 +666,13 @@ mod tests {
             let start = Instant::now();
             let t = spawn(async {
                 println!("long sleep");
-                system::timeout(Duration::from_secs(3)).await;
+                let timespec = make_timespec(Duration::from_secs(3));
+                system::timeout(&timespec).await;
                 println!("long sleep finished");
             });
             println!("short sleep");
-            system::timeout(Duration::from_secs(2)).await;
+            let timespec = make_timespec(Duration::from_secs(2));
+            system::timeout(&timespec).await;
             println!("short sleep finished");
             println!("waiting for long sleep");
             t.await;
@@ -594,5 +680,46 @@ mod tests {
         });
         println!("Slept {} ms", duration.as_millis());
         assert_eq!(true, duration < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn accept() {
+        let runtime = Runtime {};
+        runtime.run(async {
+            use std::os::unix::io::IntoRawFd;
+            use futures::select;
+
+            let l1 = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
+            let fd1 = l1.into_raw_fd();
+            let mut a1 = iou::sqe::SockAddrStorage::uninit();
+            let f1 = unsafe {
+                system::accept(fd1, Some(&mut a1))
+            };
+
+            let l2 = std::net::TcpListener::bind("127.0.0.1:12346").unwrap();
+            let fd2 = l2.into_raw_fd();
+            let mut a2 = iou::sqe::SockAddrStorage::uninit();
+            let f2 = unsafe {
+                system::accept(fd2, Some(&mut a2))
+            };
+
+            // unsafe {
+            // libc::close(fd1);
+            // libc::close(fd2);
+            // }
+
+            let (fd, addr) = select! {
+                res = f1.fuse() => {
+                    println!("12345");
+                    (res, a1)
+                },
+                res = f2.fuse() => {
+                    println!("12346");
+                    (res, a2)
+                },
+            };
+
+            println!("connected_fd: {}, addr: {}", fd.unwrap(), unsafe { addr.as_socket_addr() }.unwrap());
+        });
     }
 }
