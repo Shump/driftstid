@@ -93,7 +93,7 @@ pub mod system {
     #[derive(Copy, Clone)]
     enum State {
         Waiting,
-        Pending(usize),
+        Pending,
     }
 
     // // XXX is this necessary? does it work?
@@ -110,61 +110,45 @@ pub mod system {
     //         }
     //     }
     // }
-
-    pub async fn timeout_prime(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
+    
+    fn prep(f: impl FnOnce(&mut iou::sqe::SQE)) -> EventFuture {
         let event_id = get_event_id();
         RING.with(|ring| {
             let mut ring = ring.borrow_mut();
             let mut sqe = ring.prepare_sqe().unwrap();
+            f(&mut sqe);
             unsafe {
-                sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty()); // TODO maka parameters
                 sqe.set_user_data(event_id as u64);
             }
         });
-        let event = EventFuture {
+        EventFuture {
             event_id,
             state: State::Waiting,
-        };
-        event.await
+        }
     }
 
+    /// TODO: add params
+    /// invariant: timespec has to live until future completion
+    pub async unsafe fn timeout(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
+        prep(|sqe| sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty())).await
+    }
+
+    /// TODO: add params
     /// invariant: addr has to live until future completion
     pub async unsafe fn accept(
         fd: std::os::unix::io::RawFd,
         addr: Option<&mut iou::sqe::SockAddrStorage>
     ) -> Result<u32, std::io::Error> {
-        let event_id = get_event_id();
-        RING.with(|ring| {
-            let mut ring = ring.borrow_mut();
-            let mut sqe = ring.prepare_sqe().unwrap();
-            unsafe {
-                sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty()); // TODO maka parameter
-                sqe.set_user_data(event_id as u64);
-            }
-        });
-        let event = EventFuture {
-            event_id,
-            state: State::Waiting,
-        };
-        event.await
+        prep(|sqe| sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty())).await
     }
 
+    /// TODO: add params
+    /// invariant: socket_addr has to live until future completion
     pub async unsafe fn connect(
         fd: std::os::unix::io::RawFd,
         socket_addr: &iou::sqe::SockAddr,
     ) -> Result<u32, std::io::Error> {
-        let event_id = get_event_id();
-        RING.with(|ring| {
-            let mut ring = ring.borrow_mut();
-            let mut sqe = ring.prepare_sqe().unwrap();
-            sqe.prep_connect(fd, socket_addr);
-            sqe.set_user_data(event_id as u64);
-        });
-        let event = EventFuture {
-            event_id,
-            state: State::Waiting,
-        };
-        event.await
+        prep(|sqe| sqe.prep_connect(fd, socket_addr)).await
     }
 
     struct EventFuture<> {
@@ -193,23 +177,23 @@ pub mod system {
                         *events_prepared.borrow_mut() = true;
                     });
 
-                    self.as_mut().state = State::Pending(self.event_id);
+                    self.as_mut().state = State::Pending;
 
                     Poll::Pending
                 }
-                State::Pending(event_id) => {
+                State::Pending => {
                     EVENTS.with(|events| {
                         let mut events = events.borrow_mut();
                         use std::collections::hash_map::Entry;
-                        match events.entry(event_id) {
-                            Entry::Vacant(_) => panic!("missing event: {}", event_id),
+                        match events.entry(self.event_id) {
+                            Entry::Vacant(_) => panic!("missing event: {}", self.event_id),
                             Entry::Occupied(entry) => {
                                 match entry.get() {
                                     Event {result: Some(_), ..} => {
                                         let event = entry.remove();
                                         let result = match event.result {
                                             Some(result) => result,
-                                            None => panic!("unexpected state: {}", event_id),
+                                            None => panic!("unexpected state: {}", self.event_id),
                                         };
                                         Poll::Ready(result)
                                     }
@@ -571,7 +555,7 @@ mod tests {
         let runtime = Runtime {};
         let timespec = make_timespec(Duration::from_secs(1));
         let ret = runtime.run(async {
-            system::timeout_prime(&timespec).await;
+            unsafe { system::timeout(&timespec) }.await;
             42
         });
         assert_eq!(42, ret);
@@ -598,12 +582,12 @@ mod tests {
             let t = spawn(async {
                 println!("long sleep");
                 let timespec = make_timespec(Duration::from_secs(3));
-                system::timeout_prime(&timespec).await;
+                unsafe { system::timeout(&timespec) }.await;
                 println!("long sleep finished");
             });
             println!("short sleep");
             let timespec = make_timespec(Duration::from_secs(2));
-            system::timeout_prime(&timespec).await;
+            unsafe { system::timeout(&timespec) }.await;
             println!("short sleep finished");
             println!("waiting for long sleep");
             t.await;
@@ -613,46 +597,46 @@ mod tests {
         assert_eq!(true, duration < Duration::from_secs(5));
     }
 
-    #[test]
-    fn accept() {
-        let runtime = Runtime {};
-        runtime.run(async {
-            use std::os::unix::io::IntoRawFd;
-            use futures::select;
+    // #[test]
+    // fn accept() {
+    //     let runtime = Runtime {};
+    //     runtime.run(async {
+    //         use std::os::unix::io::IntoRawFd;
+    //         use futures::select;
 
-            let l1 = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
-            let fd1 = l1.into_raw_fd();
-            let mut a1 = iou::sqe::SockAddrStorage::uninit();
-            let f1 = unsafe {
-                system::accept(fd1, Some(&mut a1))
-            };
+    //         let l1 = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
+    //         let fd1 = l1.into_raw_fd();
+    //         let mut a1 = iou::sqe::SockAddrStorage::uninit();
+    //         let f1 = unsafe {
+    //             system::accept(fd1, Some(&mut a1))
+    //         };
 
-            let l2 = std::net::TcpListener::bind("127.0.0.1:12346").unwrap();
-            let fd2 = l2.into_raw_fd();
-            let mut a2 = iou::sqe::SockAddrStorage::uninit();
-            let f2 = unsafe {
-                system::accept(fd2, Some(&mut a2))
-            };
+    //         let l2 = std::net::TcpListener::bind("127.0.0.1:12346").unwrap();
+    //         let fd2 = l2.into_raw_fd();
+    //         let mut a2 = iou::sqe::SockAddrStorage::uninit();
+    //         let f2 = unsafe {
+    //             system::accept(fd2, Some(&mut a2))
+    //         };
 
-            // unsafe {
-            // libc::close(fd1);
-            // libc::close(fd2);
-            // }
+    //         // unsafe {
+    //         // libc::close(fd1);
+    //         // libc::close(fd2);
+    //         // }
 
-            let (fd, addr) = select! {
-                res = f1.fuse() => {
-                    println!("12345");
-                    (res, a1)
-                },
-                res = f2.fuse() => {
-                    println!("12346");
-                    (res, a2)
-                },
-            };
+    //         let (fd, addr) = select! {
+    //             res = f1.fuse() => {
+    //                 println!("12345");
+    //                 (res, a1)
+    //             },
+    //             res = f2.fuse() => {
+    //                 println!("12346");
+    //                 (res, a2)
+    //             },
+    //         };
 
-            println!("connected_fd: {}, addr: {}", fd.unwrap(), unsafe { addr.as_socket_addr() }.unwrap());
-        });
-    }
+    //         println!("connected_fd: {}, addr: {}", fd.unwrap(), unsafe { addr.as_socket_addr() }.unwrap());
+    //     });
+    // }
 
     #[test]
     fn connect() {
@@ -662,29 +646,22 @@ mod tests {
             use std::net::{TcpListener, TcpStream};
 
             let accept_task = spawn(async {
-                println!("> accept start");
                 let listener = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
                 let fd = listener.into_raw_fd();
                 let result = unsafe { system::accept(fd, None) }.await;
-                println!("> accept completed: {:?}", result);
                 result
             });
 
             let connect_task = spawn(async {
-                println!("> connect start");
                 let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
                 let socket_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
                 let sock_addr = iou::sqe::SockAddr::Inet(nix::sys::socket::InetAddr::from_std(&socket_addr));
                 let result = unsafe { system::connect(fd, &sock_addr) }.await;
-                println!("> connect completed: {:?}", result);
                 result
             });
 
-            println!("> awaiting connect");
             let connect = connect_task.await;
-            println!("> awaiting accept");
             let accept = accept_task.await;
-            // let (connect, accept) = futures::join!(connect_task, accept_task);
 
             assert_eq!(true, matches!(accept, Ok(_)));
             assert_eq!(true, matches!(connect, Ok(0)));
