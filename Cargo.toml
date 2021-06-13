@@ -7,7 +7,8 @@ edition = "2018"
 
 [dependencies]
 uring-sys = "0.7"
-iou = "0.3"
+# iou = "0.3"
+iou = { git = "https://github.com/ringbahn/iou.git" }
 libc = "0.2"
 
 [dev-dependencies]

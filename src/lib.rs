@@ -96,21 +96,6 @@ pub mod system {
         Pending,
     }
 
-    // // XXX is this necessary? does it work?
-    // // Timeout future used to have this... but not sure why?
-    // impl<'a> Drop for Timeout<'a> {
-    //     fn drop(&mut self) {
-    //         match self.state {
-    //             State::Pending(event_id) => {
-    //                 EVENTS.with(|events| {
-    //                     events.borrow_mut().remove(&event_id);
-    //                 })
-    //             }
-    //             _ => {}
-    //         }
-    //     }
-    // }
-    
     fn prep(f: impl FnOnce(&mut iou::sqe::SQE)) -> EventFuture {
         let event_id = get_event_id();
         RING.with(|ring| {
@@ -127,33 +112,158 @@ pub mod system {
         }
     }
 
+    type RawFd = std::os::unix::io::RawFd;
+    pub type SystemResult = Result<u32, std::io::Error>;
+
+    pub unsafe fn nop() -> EventFuture {
+        let f = prep(|sqe| sqe.prep_nop());
+        println!("nop: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn read_vectored(
+        fd: RawFd,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        offset: u64
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_read_vectored(fd, bufs, offset));
+        println!("read_vectored: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn write_vectored(
+        fd: RawFd,
+        bufs: &[std::io::IoSlice<'_>],
+        offset: u64,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_write_vectored(fd, bufs, offset));
+        println!("write_vectored: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn read_fixed(
+        fd: RawFd,
+        buf: &mut [u8],
+        offset: u64,
+        buf_index: u32,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_read_fixed(fd, buf, offset, buf_index));
+        println!("read_fixed: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn write_fixed(
+        fd: RawFd,
+        buf: &[u8],
+        offset: u64,
+        buf_index: usize,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_write_fixed(fd, buf, offset, buf_index));
+        println!("write_fixed: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn fsync(
+        fd: RawFd,
+        flags: iou::sqe::FsyncFlags,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_fsync(fd, flags));
+        println!("fsync: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn poll_add(
+        fd: RawFd,
+        poll_flags: iou::sqe::PollFlags,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_poll_add(fd, poll_flags));
+        println!("poll_add: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn poll_remove(
+        user_data: u64, // event_id
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_poll_remove(user_data));
+        println!("poll_remove: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn sendmsg(
+        fd: RawFd,
+        msg: *mut libc::msghdr,
+        flags: iou::sqe::MsgFlags,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_sendmsg(fd, msg, flags));
+        println!("sendmsg: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn recvmsg(
+        fd: RawFd,
+        msg: &mut libc::msghdr,
+        flags: iou::sqe::MsgFlags,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_recvmsg(fd, msg, flags));
+        println!("recvmsg: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn send(
+        fd: RawFd,
+        buf: &[u8],
+        flags: iou::sqe::MsgFlags,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_send(fd, buf, flags));
+        println!("send: {}", f.event_id());
+        f
+    }
+
+    pub unsafe fn recv(
+        fd: RawFd,
+        buf: &mut [u8],
+        flags: iou::sqe::MsgFlags,
+    ) -> EventFuture {
+        let f = prep(|sqe| sqe.prep_recv(fd, buf, flags));
+        println!("recv: {}", f.event_id());
+        f
+    }
+
     /// TODO: add params
     /// invariant: timespec has to live until future completion
-    pub async unsafe fn timeout(timespec: &uring_sys::__kernel_timespec) -> Result<u32, std::io::Error> {
-        prep(|sqe| sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty())).await
+    pub unsafe fn timeout(timespec: &uring_sys::__kernel_timespec) -> EventFuture {
+        prep(|sqe| sqe.prep_timeout(timespec, 0, iou::sqe::TimeoutFlags::empty()))
     }
 
     /// TODO: add params
     /// invariant: addr has to live until future completion
-    pub async unsafe fn accept(
+    pub unsafe fn accept(
         fd: std::os::unix::io::RawFd,
         addr: Option<&mut iou::sqe::SockAddrStorage>
-    ) -> Result<u32, std::io::Error> {
-        prep(|sqe| sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty())).await
+    ) -> EventFuture {
+        prep(|sqe| sqe.prep_accept(fd, addr, iou::sqe::SockFlag::empty()))
     }
 
     /// TODO: add params
     /// invariant: socket_addr has to live until future completion
-    pub async unsafe fn connect(
+    pub unsafe fn connect(
         fd: std::os::unix::io::RawFd,
         socket_addr: &iou::sqe::SockAddr,
-    ) -> Result<u32, std::io::Error> {
-        prep(|sqe| sqe.prep_connect(fd, socket_addr)).await
+    ) -> EventFuture {
+        prep(|sqe| sqe.prep_connect(fd, socket_addr))
     }
 
-    struct EventFuture<> {
+
+
+    pub struct EventFuture<> {
         event_id: usize,
         state: State,
+    }
+
+    impl EventFuture {
+        fn event_id(&self) -> usize {
+            self.event_id
+        }
     }
 
     impl Future for EventFuture {
@@ -204,6 +314,19 @@ pub mod system {
                                 }
                             }
                         }
+                    })
+                }
+            }
+        }
+    }
+
+    impl Drop for EventFuture {
+        fn drop(&mut self) {
+            match self.state {
+                State::Waiting => {}
+                State::Pending => {
+                    EVENTS.with(|events| {
+                        events.borrow_mut().remove(&self.event_id);
                     })
                 }
             }
@@ -529,6 +652,7 @@ impl<T> Future for Task<T> {
 mod tests {
     use super::*;
     use futures::future::FutureExt;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
 
     #[test]
     fn ready() {
@@ -546,6 +670,44 @@ mod tests {
             })
         );
         assert_eq!(42, ret);
+    }
+
+    #[test]
+    fn read_vectored() {
+        let runtime = Runtime {};
+        runtime.run(async {
+            let file_name = "read_vectored";
+            std::fs::write(file_name, b"test").unwrap();
+            let file = std::fs::File::open(file_name).unwrap();
+            let fd = file.into_raw_fd();
+            let mut buf = [0;32];
+            let mut bufs = &mut [std::io::IoSliceMut::new(&mut buf)];
+            let bytes_read = unsafe { system::read_vectored(fd, bufs, 0) }.await.unwrap();
+            assert_eq!(4, bytes_read);
+            assert_eq!(b"test"[..], buf[..4]);
+            unsafe {
+                std::fs::File::from_raw_fd(fd); // close by dropping the file
+            }
+            std::fs::remove_file(file_name).unwrap();
+        });
+    }
+
+    #[test]
+    fn write_vectored() {
+        let runtime = Runtime {};
+        runtime.run(async {
+            let file_name = "write_vectored";
+            let file = std::fs::File::create(file_name).unwrap();
+            let fd = file.into_raw_fd();
+            let buf = b"test";
+            let bufs = &[std::io::IoSlice::new(buf)];
+            let bytes_written = unsafe { system::write_vectored(fd, bufs, 0) }.await.unwrap();
+            unsafe {
+                std::fs::File::from_raw_fd(fd); // close by dropping the file
+            }
+            assert_eq!(4, bytes_written);
+            assert_eq!(b"test"[..], std::fs::read(file_name).unwrap()[..]);
+        });
     }
 
     #[test]
@@ -665,6 +827,46 @@ mod tests {
 
             assert_eq!(true, matches!(accept, Ok(_)));
             assert_eq!(true, matches!(connect, Ok(0)));
+        });
+    }
+
+    #[test]
+    fn send_recv() {
+        let runtime = Runtime {};
+        runtime.run(async {
+            use std::os::unix::io::IntoRawFd;
+            use std::net::{TcpListener, TcpStream};
+            use iou::sqe::MsgFlags;
+
+            let server = spawn(async {
+                let listener = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
+                let fd = listener.into_raw_fd();
+                let client = unsafe { system::accept(fd, None) }.await.unwrap();
+                println!("client connected: {}", client);
+                let mut buf = [0; 32];
+                let bytes_received = unsafe { system::recv(client as i32, &mut buf[..], MsgFlags::empty()) }.await.unwrap();
+                println!("received bytes: {}", bytes_received);
+                assert_eq!(b"ping"[..], buf[..bytes_received as usize]);
+                let bytes_sent = unsafe { system::send(client as i32, b"pong", MsgFlags::empty()) }.await.unwrap();
+                assert_eq!(4, bytes_sent);
+            });
+
+            let client = spawn(async {
+                let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+                let socket_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+                let sock_addr = iou::sqe::SockAddr::Inet(nix::sys::socket::InetAddr::from_std(&socket_addr));
+                let server = unsafe { system::connect(fd, &sock_addr) }.await.unwrap();
+                println!("connected to server: {}", server);
+                let bytes_sent = unsafe { system::send(fd, b"ping", MsgFlags::empty()) }.await.unwrap();
+                assert_eq!(4, bytes_sent);
+                let mut buf = [0; 32];
+                let bytes_received = unsafe { system::recv(fd, &mut buf[..], MsgFlags::empty()) }.await.unwrap();
+                println!("received bytes: {}", bytes_received);
+                assert_eq!(b"pong"[..], buf[..bytes_received as usize]);
+            });
+
+            server.await;
+            client.await;
         });
     }
 }
