@@ -10,7 +10,7 @@ uring-sys = "0.7"
 # iou = "0.3"
 iou = { git = "https://github.com/ringbahn/iou.git" }
 libc = "0.2"
+nix = "0.18"
+futures = "0.3"
 
 [dev-dependencies]
-futures = "0.3"
-nix = "0.18"

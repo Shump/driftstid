@@ -49,6 +49,7 @@ mod v_table {
 pub struct Event {
     waker: std::task::Waker,
     result: Option<Result<u32, std::io::Error>>,
+    event_completions: Vec<std::task::Waker>,
 }
 
 mod inner {
@@ -215,7 +216,7 @@ pub mod system {
         flags: iou::sqe::MsgFlags,
     ) -> EventFuture {
         let f = prep(|sqe| sqe.prep_send(fd, buf, flags));
-        println!("send: {}", f.event_id());
+        println!("send: fd = {}, event_id = {}", fd, f.event_id());
         f
     }
 
@@ -256,7 +257,7 @@ pub mod system {
 
 
     pub struct EventFuture<> {
-        event_id: usize,
+        pub event_id: usize,
         state: State,
     }
 
@@ -278,7 +279,7 @@ pub mod system {
                         use std::collections::hash_map::Entry;
                         if let Entry::Vacant(entry) = events.entry(self.event_id) {
                             let waker = cx.waker().clone();
-                            let event = Event {waker, result: None};
+                            let event = Event {waker, result: None, event_completions: Vec::new()};
                             entry.insert(event);
                         }
                     });
@@ -333,7 +334,7 @@ pub mod system {
         }
     }
 
-    fn get_event_id() -> usize {
+    pub fn get_event_id() -> usize {
         NEXT_EVENT_ID.with(|next_event_id| {
             let mut next_event_id = next_event_id.borrow_mut();
             let event_id = *next_event_id;
@@ -347,49 +348,49 @@ pub mod system {
     }
 }
 
-// TODO enhance
-#[derive(Debug)]
-struct Error {
-    msg: String,
-}
+// // TODO enhance
+// #[derive(Debug)]
+// struct Error {
+//     msg: String,
+// }
 
-impl Error {
-    pub fn new<E: std::error::Error>(e: E) -> Self {
-        Self {
-            msg: format!("{}", e),
-        }
-    }
-}
+// impl Error {
+//     pub fn new<E: std::error::Error>(e: E) -> Self {
+//         Self {
+//             msg: format!("{}", e),
+//         }
+//     }
+// }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        write!(f, "{}", self.msg)
-    }
-}
+// impl std::fmt::Display for Error {
+//     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+//         write!(f, "{}", self.msg)
+//     }
+// }
 
-impl std::error::Error for Error {}
+// impl std::error::Error for Error {}
 
-pub mod net {
-    use std::net::ToSocketAddrs;
-    use super::Error;
+// pub mod net {
+//     use std::net::ToSocketAddrs;
+//     use super::Error;
 
-    pub struct TcpListener {
-        listener: std::net::TcpListener,
-    }
+//     pub struct TcpListener {
+//         listener: std::net::TcpListener,
+//     }
 
-    impl TcpListener {
-        // TODO tokio uses custom ToSocketAddrs
-        pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, Error> {
-            let listener = Self {
-                listener: std::net::TcpListener::bind(addr).map_err(Error::new)?,
-            };
-            Ok(listener)
-        }
-    }
+//     impl TcpListener {
+//         // TODO tokio uses custom ToSocketAddrs
+//         pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, Error> {
+//             let listener = Self {
+//                 listener: std::net::TcpListener::bind(addr).map_err(Error::new)?,
+//             };
+//             Ok(listener)
+//         }
+//     }
 
-    pub struct TcpAccept {
-    }
-}
+//     pub struct TcpAccept {
+//     }
+// }
 
 // XXX Not sure this future is valid?
 pub struct ToggleFuture {
@@ -543,10 +544,13 @@ impl Runtime {
                     for (event_id, result) in completed_events {
                         println!("Waking up waker: {}", event_id);
                         match events.borrow_mut().get_mut(&event_id) {
-                            Some(Event {waker, result: res}) => {
+                            Some(Event {waker, result: res, event_completions}) => {
                                 // println!("timeout result: {:?}", result);
                                 waker.wake_by_ref();
                                 *res = Some(result);
+                                for ec in event_completions {
+                                    ec.wake_by_ref();
+                                }
                             }
                             None => {
                                 // XXX
@@ -645,6 +649,289 @@ impl<T> Future for Task<T> {
         storage.waker = Some(waker);
 
         Poll::Pending
+    }
+}
+
+// XXX could just store closures that are executed on completion that drops the rc?
+struct EventCompletion {
+    target_event_id: usize,
+    primed: bool, // XXX use enum
+}
+
+impl Future for EventCompletion {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        if !self.primed {
+            EVENTS.with(|events| {
+                let waker = cx.waker().clone();
+                events
+                    .borrow_mut()
+                    .get_mut(&self.target_event_id)
+                    .map(|event| {
+                        event
+                            .event_completions
+                            .push(waker);
+                    });
+            });
+            self.primed = true;
+            Poll::Pending
+        } else {
+            // XXX recycling event_ids becomes problematic...
+            let completed = EVENTS.with(|events| {
+                events.borrow().get(&self.target_event_id).is_none()
+            });
+            if completed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+}
+
+pub mod net {
+    use std::io::{Error, Result};
+    use std::os::unix::io::{RawFd, AsRawFd, FromRawFd, IntoRawFd};
+    use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+    use std::net::{ToSocketAddrs, SocketAddr};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::rc::Rc;
+    use std::cell::RefCell;
+
+    enum TcpStreamState {
+        Idle,
+        PollRegistered(crate::system::EventFuture),
+    }
+
+    pub struct TcpStream {
+        fd: RawFd,
+        state: TcpStreamState,
+    }
+
+    impl AsRawFd for TcpStream {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    impl FromRawFd for TcpStream {
+        unsafe fn from_raw_fd(fd: RawFd) -> Self {
+            TcpStream {fd, state: TcpStreamState::Idle}
+        }
+    }
+
+    impl IntoRawFd for TcpStream {
+        fn into_raw_fd(self) -> RawFd {
+            self.fd
+        }
+    }
+
+    impl futures::io::AsyncRead for TcpStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize>> {
+            use TcpStreamState::*;
+            let fd = self.fd;
+            match &mut self.state {
+                Idle => {
+                    println!("adding fd = {} to poll", fd);
+                    let event = unsafe {
+                        crate::system::poll_add(
+                            fd,
+                            iou::sqe::PollFlags::POLLIN,
+                        )
+                    };
+                    self.state = PollRegistered(event);
+                    let mut event = unsafe {
+                        let this = self.get_unchecked_mut();
+                        if let PollRegistered(event) = &mut this.state {
+                            Pin::new_unchecked(event)
+                        } else {
+                            panic!()
+                        }
+                    };
+                    match event.poll(cx) {
+                        Poll::Pending => {
+                            println!("fd = {} still pending", fd);
+                            Poll::Pending
+                        }
+                        Poll::Ready(Ok(v)) => {
+                            println!("fd = {} ready", fd);
+                            println!("poll ready: {}", v);
+                            println!("last error: {:?}", std::io::Error::last_os_error());
+                            let mut stream = unsafe {
+                                StdTcpStream::from_raw_fd(fd)
+                            };
+                            use std::io::Read;
+                            let res = stream.read(buf);
+                            let _ = stream.into_raw_fd(); // To prevent close call
+                            Poll::Ready(res)
+                        }
+                        Poll::Ready(Err(e)) => {
+                            eprintln!("fd = {} poll failed: {}", fd, e);
+                            Poll::Ready(Err(e))
+                        }
+                    }
+                }
+                PollRegistered(event) => {
+                    let mut event = unsafe {
+                        Pin::new_unchecked(event)
+                    };
+                    match event.poll(cx) {
+                        Poll::Pending => {
+                            Poll::Pending
+                        }
+                        Poll::Ready(Ok(v)) => {
+                            println!("poll ready: {}", v);
+                            println!("last errir: {:?}", std::io::Error::last_os_error());
+                            let mut stream = unsafe {
+                                StdTcpStream::from_raw_fd(fd)
+                            };
+                            use std::io::Read;
+                            let res = stream.read(buf);
+                            let _ = stream.into_raw_fd(); // To prevent close call
+                            Poll::Ready(res)
+                        }
+                        Poll::Ready(Err(e)) => {
+                            eprintln!("poll failed: {}", e);
+                            Poll::Ready(Err(e))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // impl TcpStream {
+    //     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpStream> {
+    //         unsafe {
+    //             let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    //             let socket_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    //             let sock_addr = iou::sqe::SockAddr::Inet(nix::sys::socket::InetAddr::from_std(&socket_addr));
+    //             let server = unsafe { system::connect(fd, &sock_addr) }.await.unwrap();
+    //             println!("connected to server: {}", server);
+    //             let bytes_sent = unsafe { system::send(fd, b"ping", MsgFlags::empty()) }.await.unwrap();
+    //             assert_eq!(4, bytes_sent);
+    //             let mut buf = [0; 32];
+    //             let bytes_received = unsafe { system::recv(fd, &mut buf[..], MsgFlags::empty()) }.await.unwrap();
+    //             println!("received bytes: {}", bytes_received);
+    //             assert_eq!(b"pong"[..], buf[..bytes_received as usize]);
+    //         }
+    //     }
+    // }
+
+    pub struct TcpListener {
+        fd: RawFd,
+    }
+
+    impl TcpListener {
+        pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
+            let listener = StdTcpListener::bind(addr)?;
+            let fd = listener.into_raw_fd();
+            let listener = TcpListener {fd};
+            Ok(listener)
+        }
+
+        pub async fn accept(&self) -> Result<(TcpStream, SocketAddr)> {
+            let address_storage = Rc::new(RefCell::new(iou::sqe::SockAddrStorage::uninit()));
+            let accept = unsafe { crate::system::accept(self.fd, Some(&mut *address_storage.as_ptr())) };
+            let accept = Accept {
+                listener: self,
+                address_storage: address_storage.clone(),
+                event_id: accept.event_id,
+                future: accept,
+                completed: false,
+            };
+            let fd = accept.await?;
+            let stream = unsafe { TcpStream::from_raw_fd(fd as i32) };
+            let addr = unsafe { address_storage.borrow().as_socket_addr() }?;
+            let addr = to_std_socket_addr(addr)?;
+            Ok((stream, addr))
+        }
+    }
+
+    impl AsRawFd for TcpListener {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    impl FromRawFd for TcpListener {
+        unsafe fn from_raw_fd(fd: RawFd) -> Self {
+            TcpListener { fd }
+        }
+    }
+
+    impl IntoRawFd for TcpListener {
+        fn into_raw_fd(self) -> RawFd {
+            self.fd
+        }
+    }
+
+    struct Accept<'a> {
+        listener: &'a TcpListener,
+        address_storage: Rc<RefCell<iou::sqe::SockAddrStorage>>,
+        event_id: usize,
+        future: crate::system::EventFuture, // XXX if I box it, I could move it into a task without breaking pin or knowing event_id...
+        completed: bool,
+    }
+
+    impl<'a> Future for Accept<'a> {
+        type Output = std::result::Result<u32, std::io::Error>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let (mut future, mut completed) = unsafe {
+                let this = self.get_unchecked_mut();
+                (
+                    Pin::new_unchecked(&mut this.future),
+                    Pin::new_unchecked(&mut this.completed),
+                )
+            };
+            // let poll = unsafe { self.map_unchecked_mut(|s| &mut s.future).poll(cx) }; // XXX need to read up on pin
+            match future.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    completed.set(true);
+                    Poll::Ready(result)
+                }
+            }
+        }
+    }
+
+    impl<'a> Drop for Accept<'a> {
+        fn drop(&mut self) {
+            if !self.completed {
+                let event_id = self.event_id;
+                let address_storage = self.address_storage.clone();
+                crate::spawn(async move {
+                    let _ = address_storage;
+                    crate::EventCompletion { target_event_id: event_id, primed: false }.await;
+                });
+            }
+        }
+    }
+
+    fn to_iou_sock_addr<A: ToSocketAddrs>(addr: A) -> Result<iou::sqe::SockAddr> {
+        use nix::sys::socket::InetAddr;
+        let addr = addr.to_socket_addrs()?.next().unwrap(); // XXX
+        let addr = InetAddr::from_std(&addr);
+        let addr = iou::sqe::SockAddr::new_inet(addr);
+        Ok(addr)
+    }
+
+    fn to_std_socket_addr(addr: iou::sqe::SockAddr) -> Result<SocketAddr> {
+        use iou::sqe::SockAddr::*;
+        match addr {
+            Inet(addr) => {
+                Ok(addr.to_std())
+            }
+            _ => todo!(),
+        }
     }
 }
 
@@ -759,6 +1046,27 @@ mod tests {
         assert_eq!(true, duration < Duration::from_secs(5));
     }
 
+    // // XXX not sure if it really should be possible to poll on separate tasks...
+    // #[test]
+    // fn move_task() {
+    //     let runtime = Runtime {};
+    //     runtime.run(async {
+    //         use futures::prelude::*;
+
+    //         println!("main task");
+
+    //         let f = async {
+    //             println!("step 1");
+    //         }
+    //         .then(|_| async {
+    //             println!("step 2");
+    //         })
+    //         .boxed();
+
+            
+    //     });
+    // }
+
     // #[test]
     // fn accept() {
     //     let runtime = Runtime {};
@@ -834,20 +1142,19 @@ mod tests {
     fn send_recv() {
         let runtime = Runtime {};
         runtime.run(async {
-            use std::os::unix::io::IntoRawFd;
+            use std::os::unix::io::{AsRawFd, IntoRawFd};
             use std::net::{TcpListener, TcpStream};
             use iou::sqe::MsgFlags;
+            use futures::prelude::*;
+            use std::time::Duration;
 
             let server = spawn(async {
-                let listener = std::net::TcpListener::bind("127.0.0.1:12345").unwrap();
-                let fd = listener.into_raw_fd();
-                let client = unsafe { system::accept(fd, None) }.await.unwrap();
-                println!("client connected: {}", client);
+                let listener = net::TcpListener::bind("127.0.0.1:12345").await.unwrap();
+                let (mut client, addr) = listener.accept().await.unwrap();
                 let mut buf = [0; 32];
-                let bytes_received = unsafe { system::recv(client as i32, &mut buf[..], MsgFlags::empty()) }.await.unwrap();
-                println!("received bytes: {}", bytes_received);
+                let bytes_received = client.read(&mut buf[..]).await.unwrap();
                 assert_eq!(b"ping"[..], buf[..bytes_received as usize]);
-                let bytes_sent = unsafe { system::send(client as i32, b"pong", MsgFlags::empty()) }.await.unwrap();
+                let bytes_sent = unsafe { system::send(client.as_raw_fd() as i32, b"pong", MsgFlags::empty()) }.await.unwrap();
                 assert_eq!(4, bytes_sent);
             });
 
@@ -856,17 +1163,36 @@ mod tests {
                 let socket_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
                 let sock_addr = iou::sqe::SockAddr::Inet(nix::sys::socket::InetAddr::from_std(&socket_addr));
                 let server = unsafe { system::connect(fd, &sock_addr) }.await.unwrap();
-                println!("connected to server: {}", server);
                 let bytes_sent = unsafe { system::send(fd, b"ping", MsgFlags::empty()) }.await.unwrap();
                 assert_eq!(4, bytes_sent);
                 let mut buf = [0; 32];
                 let bytes_received = unsafe { system::recv(fd, &mut buf[..], MsgFlags::empty()) }.await.unwrap();
-                println!("received bytes: {}", bytes_received);
                 assert_eq!(b"pong"[..], buf[..bytes_received as usize]);
             });
 
             server.await;
             client.await;
+        });
+    }
+
+    #[test]
+    fn my_test() {
+        use std::os::unix::io::AsRawFd;
+        use futures::prelude::*;
+        use iou::sqe::MsgFlags;
+
+        let runtime = Runtime {};
+        runtime.run(async {
+            let listener = net::TcpListener::bind("127.0.0.1:12345").await.unwrap();
+            let (mut client, addr) = listener.accept().await.unwrap();
+            println!("client connected: {}, {}", client.as_raw_fd(), addr);
+            let mut buf = [0; 32];
+            let bytes_received = client.read(&mut buf[..]).await.unwrap(); // XXX according to `ltrace -S -f` it is `close(` ing the fd after this...
+            println!("received bytes: {}", bytes_received);
+            println!("msg: {:?}", std::str::from_utf8(&buf[..bytes_received]).unwrap());
+            println!("sending");
+            let bytes_sent = unsafe { system::send(client.as_raw_fd() as i32, b"pong", MsgFlags::empty()) }.await.unwrap();
+            println!("sent bytes: {}", bytes_sent);
         });
     }
 }
