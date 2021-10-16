@@ -254,8 +254,6 @@ pub mod system {
         prep(|sqe| sqe.prep_connect(fd, socket_addr))
     }
 
-
-
     pub struct EventFuture<> {
         pub event_id: usize,
         state: State,
@@ -706,9 +704,50 @@ pub mod net {
         PollRegistered(crate::system::EventFuture),
     }
 
+    struct Connect {
+        address: Rc<iou::sqe::SockAddr>,
+        event_id: usize,
+        future: crate::system::EventFuture, // XXX if I box it, I could move it into a task without breaking pin or knowing event_id...
+        completed: bool,
+    }
+
+    impl<'a> Future for Connect {
+        type Output = std::result::Result<u32, std::io::Error>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut future = unsafe { Pin::new_unchecked(&mut self.future) };
+            // let poll = unsafe { self.map_unchecked_mut(|s| &mut s.future).poll(cx) }; // XXX need to read up on pin
+            match future.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.completed = true;
+                    Poll::Ready(result)
+                }
+            }
+        }
+    }
+
     pub struct TcpStream {
         fd: RawFd,
         state: TcpStreamState,
+    }
+
+    impl TcpStream {
+        pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpStream> {
+            // let address_storage = Rc::new(RefCell::new(iou::sqe::SockAddrStorage::uninit()));
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            let address = Rc::new(to_iou_sock_addr(addr)?);
+            let connect = unsafe { crate::system::connect(fd, address.as_ref()) };
+            let connect = Connect {
+                address: address.clone(),
+                event_id: connect.event_id,
+                future: connect,
+                completed: false,
+            };
+            connect.await?; // XXX need to check return value?
+            let stream = unsafe { TcpStream::from_raw_fd(fd as i32) };
+            Ok(stream)
+        }
     }
 
     impl AsRawFd for TcpStream {
@@ -747,36 +786,8 @@ pub mod net {
                         )
                     };
                     self.state = PollRegistered(event);
-                    let mut event = unsafe {
-                        let this = self.get_unchecked_mut();
-                        if let PollRegistered(event) = &mut this.state {
-                            Pin::new_unchecked(event)
-                        } else {
-                            panic!()
-                        }
-                    };
-                    match event.poll(cx) {
-                        Poll::Pending => {
-                            println!("fd = {} still pending", fd);
-                            Poll::Pending
-                        }
-                        Poll::Ready(Ok(v)) => {
-                            println!("fd = {} ready", fd);
-                            println!("poll ready: {}", v);
-                            println!("last error: {:?}", std::io::Error::last_os_error());
-                            let mut stream = unsafe {
-                                StdTcpStream::from_raw_fd(fd)
-                            };
-                            use std::io::Read;
-                            let res = stream.read(buf);
-                            let _ = stream.into_raw_fd(); // To prevent close call
-                            Poll::Ready(res)
-                        }
-                        Poll::Ready(Err(e)) => {
-                            eprintln!("fd = {} poll failed: {}", fd, e);
-                            Poll::Ready(Err(e))
-                        }
-                    }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
                 }
                 PollRegistered(event) => {
                     let mut event = unsafe {
@@ -787,23 +798,122 @@ pub mod net {
                             Poll::Pending
                         }
                         Poll::Ready(Ok(v)) => {
-                            println!("poll ready: {}", v);
-                            println!("last errir: {:?}", std::io::Error::last_os_error());
+                            println!("poll ready: fd = {}, {}", fd, v);
                             let mut stream = unsafe {
-                                StdTcpStream::from_raw_fd(fd)
+                                StdTcpStream::from_raw_fd(fd) // XXX don't use std TcpStream
                             };
                             use std::io::Read;
                             let res = stream.read(buf);
                             let _ = stream.into_raw_fd(); // To prevent close call
+                            self.state = Idle;
                             Poll::Ready(res)
                         }
                         Poll::Ready(Err(e)) => {
                             eprintln!("poll failed: {}", e);
+                            self.state = Idle;
                             Poll::Ready(Err(e))
                         }
                     }
                 }
             }
+        }
+    }
+
+    impl futures::io::AsyncWrite for TcpStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize>> {
+            use TcpStreamState::*;
+            let fd = self.fd;
+            match &mut self.state {
+                Idle => {
+                    println!("adding fd = {} to poll", fd);
+                    let event = unsafe {
+                        crate::system::poll_add(
+                            fd,
+                            iou::sqe::PollFlags::POLLOUT, // XXX Writing is now possible, though a
+                                                          // write larger that the available space in a socket or pipe will still
+                                                          // block (unless O_NONBLOCK is set).
+                        )
+                    };
+                    self.state = PollRegistered(event);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                PollRegistered(event) => {
+                    let mut event = unsafe {
+                        Pin::new_unchecked(event)
+                    };
+                    match event.poll(cx) {
+                        Poll::Pending => {
+                            println!("fd = {} still pending", fd);
+                            Poll::Pending
+                        }
+                        Poll::Ready(Ok(v)) => {
+                            println!("fd = {} ready", fd);
+                            println!("poll ready: {}", v);
+                            let mut stream = unsafe {
+                                StdTcpStream::from_raw_fd(fd) // XXX don't use std TcpStream
+                            };
+                            use std::io::Write;
+                            let res = stream.write(buf);
+                            let _ = stream.into_raw_fd(); // To prevent close call
+                            use std::io::ErrorKind::*;
+                            match res.as_ref().map_err(Error::kind) {
+                                Ok(_) => {
+                                    self.state = Idle;
+                                    Poll::Ready(res)
+                                },
+                                // https://docs.rs/futures/0.3.15/futures/io/trait.AsyncWrite.html#tymethod.poll_write
+                                // This function may not return errors of kind WouldBlock or
+                                // Interrupted. Implementations must convert WouldBlock into
+                                // Poll::Pending and either internally retry or convert
+                                // Interrupted into another error kind.
+                                Err(WouldBlock) => {
+                                    println!("write would block");
+                                    // Mark as idle and wake up to retry.
+                                    self.state = Idle;
+                                    cx.waker().wake_by_ref();
+                                    Poll::Pending
+                                }
+                                Err(Interrupted) => {
+                                    println!("write interrupted");
+                                    // Mark as idle and wake up to retry.
+                                    self.state = Idle;
+                                    cx.waker().wake_by_ref();
+                                    Poll::Pending
+                                }
+                                Err(_) => {
+                                    self.state = Idle;
+                                    Poll::Ready(res)
+                                },
+
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            eprintln!("poll failed: {}", e);
+                            self.state = Idle;
+                            Poll::Ready(Err(e))
+                        }
+                    }
+                }
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<()>> {
+            todo!()
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<()>> {
+            todo!()
         }
     }
 
@@ -1154,45 +1264,21 @@ mod tests {
                 let mut buf = [0; 32];
                 let bytes_received = client.read(&mut buf[..]).await.unwrap();
                 assert_eq!(b"ping"[..], buf[..bytes_received as usize]);
-                let bytes_sent = unsafe { system::send(client.as_raw_fd() as i32, b"pong", MsgFlags::empty()) }.await.unwrap();
+                let bytes_sent = client.write(b"pong").await.unwrap();
                 assert_eq!(4, bytes_sent);
             });
 
             let client = spawn(async {
-                let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-                let socket_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-                let sock_addr = iou::sqe::SockAddr::Inet(nix::sys::socket::InetAddr::from_std(&socket_addr));
-                let server = unsafe { system::connect(fd, &sock_addr) }.await.unwrap();
-                let bytes_sent = unsafe { system::send(fd, b"ping", MsgFlags::empty()) }.await.unwrap();
+                let mut server = net::TcpStream::connect("127.0.0.1:12345").await.unwrap();
+                let bytes_sent = server.write(b"ping").await.unwrap();
                 assert_eq!(4, bytes_sent);
                 let mut buf = [0; 32];
-                let bytes_received = unsafe { system::recv(fd, &mut buf[..], MsgFlags::empty()) }.await.unwrap();
+                let bytes_received = server.read(&mut buf[..]).await.unwrap();
                 assert_eq!(b"pong"[..], buf[..bytes_received as usize]);
             });
 
             server.await;
             client.await;
-        });
-    }
-
-    #[test]
-    fn my_test() {
-        use std::os::unix::io::AsRawFd;
-        use futures::prelude::*;
-        use iou::sqe::MsgFlags;
-
-        let runtime = Runtime {};
-        runtime.run(async {
-            let listener = net::TcpListener::bind("127.0.0.1:12345").await.unwrap();
-            let (mut client, addr) = listener.accept().await.unwrap();
-            println!("client connected: {}, {}", client.as_raw_fd(), addr);
-            let mut buf = [0; 32];
-            let bytes_received = client.read(&mut buf[..]).await.unwrap(); // XXX according to `ltrace -S -f` it is `close(` ing the fd after this...
-            println!("received bytes: {}", bytes_received);
-            println!("msg: {:?}", std::str::from_utf8(&buf[..bytes_received]).unwrap());
-            println!("sending");
-            let bytes_sent = unsafe { system::send(client.as_raw_fd() as i32, b"pong", MsgFlags::empty()) }.await.unwrap();
-            println!("sent bytes: {}", bytes_sent);
         });
     }
 }
